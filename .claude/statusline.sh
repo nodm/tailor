@@ -27,14 +27,27 @@ eval "$(jq -r '
     @sh "seven_day=\(.rate_limits.seven_day.used_percentage // "")"
 ' 2>/dev/null)"
 
-# Format tokens with k suffix (pure bash, no subprocess)
+# Helpers assign into the variable named by $1 via printf -v, so calling them
+# needs no $(...) subshell.
+
+# fmt_k VAR N: format tokens with k suffix
 fmt_k() {
-  if [ "$1" -ge 1000 ]; then echo "$(($1 / 1000))k"; else echo "$1"; fi
+  if [ "$2" -ge 1000 ]; then printf -v "$1" '%sk' "$(($2 / 1000))"; else printf -v "$1" '%s' "$2"; fi
 }
 
-# Directory name (parameter expansion instead of forking basename)
+# pct_color VAR PCT: color based on usage level
+pct_color() {
+  if [ "$2" -ge 80 ]; then printf -v "$1" '%s' "$RED"
+  elif [ "$2" -ge 50 ]; then printf -v "$1" '%s' "$YELLOW"
+  else printf -v "$1" '%s' "$GREEN"; fi
+}
+
+# Directory name, like basename but without forking: strip trailing slashes,
+# take the last component, and fall back to "/" for the root
 if [ -n "$current_dir" ]; then
-  path_display="${DIM}dir${RESET} ${CYAN}${current_dir##*/}${RESET}"
+  dir_name="${current_dir%"${current_dir##*[!/]}"}"
+  dir_name="${dir_name##*/}"
+  path_display="${DIM}dir${RESET} ${CYAN}${dir_name:-/}${RESET}"
 else
   path_display="${DIM}dir${RESET} ${CYAN}~${RESET}"
 fi
@@ -78,28 +91,30 @@ if [ "${has_usage:-0}" -eq 1 ]; then
       ctx_color="$MAGENTA"
     fi
 
-    context_usage=" ${DIM}·${RESET} ${DIM}ctx${RESET} ${ctx_color}$(fmt_k "$total_current")/$(fmt_k "$window_size") (${pct}%)${RESET}"
+    fmt_k tokens_display "$total_current"
+    fmt_k window_display "$window_size"
+    context_usage=" ${DIM}·${RESET} ${DIM}ctx${RESET} ${ctx_color}${tokens_display}/${window_display} (${pct}%)${RESET}"
   fi
 
   if [ "$cache_creation" -gt 0 ] || [ "$cache_read" -gt 0 ]; then
-    cache_info=" ${DIM}·${RESET} ${DIM}cache${RESET} ${GREEN}w:$(fmt_k "$cache_creation")${RESET} ${GREEN}r:$(fmt_k "$cache_read")${RESET}"
+    fmt_k cache_write_display "$cache_creation"
+    fmt_k cache_read_display "$cache_read"
+    cache_info=" ${DIM}·${RESET} ${DIM}cache${RESET} ${GREEN}w:${cache_write_display}${RESET} ${GREEN}r:${cache_read_display}${RESET}"
   fi
 fi
 
 # Session usage (Claude.ai subscription rate limits)
-pct_color() {
-  if [ "$1" -ge 80 ]; then echo "$RED"; elif [ "$1" -ge 50 ]; then echo "$YELLOW"; else echo "$GREEN"; fi
-}
-
 session_parts=""
 if [ -n "$five_hour" ]; then
   printf -v five_pct '%.0f' "$five_hour"
-  session_parts="$(pct_color "$five_pct")5h:${five_pct}%${RESET}"
+  pct_color s_color "$five_pct"
+  session_parts="${s_color}5h:${five_pct}%${RESET}"
 fi
 if [ -n "$seven_day" ]; then
   printf -v week_pct '%.0f' "$seven_day"
+  pct_color w_color "$week_pct"
   [ -n "$session_parts" ] && session_parts="${session_parts} "
-  session_parts="${session_parts}$(pct_color "$week_pct")7d:${week_pct}%${RESET}"
+  session_parts="${session_parts}${w_color}7d:${week_pct}%${RESET}"
 fi
 session_info=""
 [ -n "$session_parts" ] && session_info=" ${DIM}·${RESET} ${DIM}session${RESET} ${session_parts}"
