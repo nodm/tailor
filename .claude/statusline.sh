@@ -10,30 +10,62 @@ RED='\033[0;31m'
 RESET='\033[0m'
 DIM='\033[2m'
 
-# Read JSON input from stdin
-input=$(cat)
+# Extract every field in ONE jq call. jq reads the JSON straight from stdin
+# and prints shell-quoted assignments (via @sh), which eval turns into variables.
+eval "$(jq -r '
+  .context_window as $cw
+  | $cw.current_usage as $u
+  | @sh "current_dir=\(.workspace.current_dir // "")",
+    @sh "model_name=\(.model.display_name // "")",
+    @sh "effort_level=\(.effort.level // "")",
+    @sh "has_usage=\(if $u == null then 0 else 1 end)",
+    @sh "input_tokens=\($u.input_tokens // 0)",
+    @sh "cache_creation=\($u.cache_creation_input_tokens // 0)",
+    @sh "cache_read=\($u.cache_read_input_tokens // 0)",
+    @sh "window_size=\($cw.context_window_size // 0)",
+    @sh "five_hour=\(.rate_limits.five_hour.used_percentage // "")",
+    @sh "seven_day=\(.rate_limits.seven_day.used_percentage // "")"
+' 2>/dev/null)"
 
-# Extract values from JSON
-current_dir=$(echo "$input" | jq -r '.workspace.current_dir')
-model_name=$(echo "$input" | jq -r '.model.display_name')
-effort_level=$(echo "$input" | jq -r '.effort.level // empty')
-context_window=$(echo "$input" | jq '.context_window')
-rate_limits=$(echo "$input" | jq '.rate_limits')
+# Helpers assign into the variable named by $1 via printf -v, so calling them
+# needs no $(...) subshell.
 
-# Get relative path or basename
+# fmt_k VAR N: format tokens with k suffix
+fmt_k() {
+  if [ "$2" -ge 1000 ]; then printf -v "$1" '%sk' "$(($2 / 1000))"; else printf -v "$1" '%s' "$2"; fi
+}
+
+# pct_color VAR PCT: color based on usage level
+pct_color() {
+  if [ "$2" -ge 80 ]; then printf -v "$1" '%s' "$RED"
+  elif [ "$2" -ge 50 ]; then printf -v "$1" '%s' "$YELLOW"
+  else printf -v "$1" '%s' "$GREEN"; fi
+}
+
+# Directory name, like basename but without forking: strip trailing slashes,
+# take the last component, and fall back to "/" for the root
 if [ -n "$current_dir" ]; then
-  path_display="${DIM}dir${RESET} ${CYAN}$(basename "$current_dir")${RESET}"
+  dir_name="${current_dir%"${current_dir##*[!/]}"}"
+  dir_name="${dir_name##*/}"
+  path_display="${DIM}dir${RESET} ${CYAN}${dir_name:-/}${RESET}"
 else
   path_display="${DIM}dir${RESET} ${CYAN}~${RESET}"
 fi
 
-# Get git branch and status (skip optional locks for performance)
+# Git branch and dirty count from a single git call.
+# Porcelain v2 prints "# branch.head <name>" headers, then one line per change.
 git_info=""
-if [ -d "$current_dir/.git" ] || git -C "$current_dir" rev-parse --git-dir > /dev/null 2>&1; then
-  branch=$(git -C "$current_dir" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null || echo "detached")
-
-  # Check if there are changes (skip locks)
-  dirty_count=$(git -C "$current_dir" --no-optional-locks status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+if [ -n "$current_dir" ] && git_out=$(git -C "$current_dir" --no-optional-locks status --porcelain=v2 --branch 2>/dev/null); then
+  branch="detached"
+  dirty_count=0
+  while IFS= read -r line; do
+    case "$line" in
+      "# branch.head (detached)") ;;
+      "# branch.head "*) branch="${line#\# branch.head }" ;;
+      "#"*) ;;
+      ?*) dirty_count=$((dirty_count + 1)) ;;
+    esac
+  done <<< "$git_out"
   if [ "$dirty_count" -gt 0 ]; then
     git_info=" ${DIM}·${RESET} ${DIM}branch${RESET} ${YELLOW}${branch} (${dirty_count})${RESET}"
   else
@@ -41,32 +73,14 @@ if [ -d "$current_dir/.git" ] || git -C "$current_dir" rev-parse --git-dir > /de
   fi
 fi
 
-# Calculate context window percentage
+# Context window percentage and cache write/read info
 context_usage=""
-current_usage=$(echo "$context_window" | jq '.current_usage')
-if [ "$current_usage" != "null" ]; then
-  input_tokens=$(echo "$current_usage" | jq '.input_tokens // 0')
-  cache_creation=$(echo "$current_usage" | jq '.cache_creation_input_tokens // 0')
-  cache_read=$(echo "$current_usage" | jq '.cache_read_input_tokens // 0')
+cache_info=""
+if [ "${has_usage:-0}" -eq 1 ]; then
   total_current=$((input_tokens + cache_creation + cache_read))
-
-  window_size=$(echo "$context_window" | jq '.context_window_size')
 
   if [ "$window_size" -gt 0 ]; then
     pct=$((total_current * 100 / window_size))
-
-    # Format tokens with k suffix
-    if [ "$total_current" -ge 1000 ]; then
-      tokens_display="$((total_current / 1000))k"
-    else
-      tokens_display="${total_current}"
-    fi
-
-    if [ "$window_size" -ge 1000 ]; then
-      window_display="$((window_size / 1000))k"
-    else
-      window_display="${window_size}"
-    fi
 
     # Color based on usage level
     if [ "$pct" -ge 80 ]; then
@@ -77,66 +91,33 @@ if [ "$current_usage" != "null" ]; then
       ctx_color="$MAGENTA"
     fi
 
+    fmt_k tokens_display "$total_current"
+    fmt_k window_display "$window_size"
     context_usage=" ${DIM}·${RESET} ${DIM}ctx${RESET} ${ctx_color}${tokens_display}/${window_display} (${pct}%)${RESET}"
   fi
-fi
 
-# Cache write/read info
-cache_info=""
-if [ "$current_usage" != "null" ]; then
-  cache_write_tok=$(echo "$current_usage" | jq '.cache_creation_input_tokens // 0')
-  cache_read_tok=$(echo "$current_usage" | jq '.cache_read_input_tokens // 0')
-
-  if [ "$cache_write_tok" -gt 0 ] || [ "$cache_read_tok" -gt 0 ]; then
-    if [ "$cache_write_tok" -ge 1000 ]; then
-      cache_write_display="$((cache_write_tok / 1000))k"
-    else
-      cache_write_display="${cache_write_tok}"
-    fi
-
-    if [ "$cache_read_tok" -ge 1000 ]; then
-      cache_read_display="$((cache_read_tok / 1000))k"
-    else
-      cache_read_display="${cache_read_tok}"
-    fi
-
+  if [ "$cache_creation" -gt 0 ] || [ "$cache_read" -gt 0 ]; then
+    fmt_k cache_write_display "$cache_creation"
+    fmt_k cache_read_display "$cache_read"
     cache_info=" ${DIM}·${RESET} ${DIM}cache${RESET} ${GREEN}w:${cache_write_display}${RESET} ${GREEN}r:${cache_read_display}${RESET}"
   fi
 fi
 
 # Session usage (Claude.ai subscription rate limits)
-session_info=""
-if [ "$rate_limits" != "null" ]; then
-  five_hour=$(echo "$rate_limits" | jq -r '.five_hour.used_percentage // empty')
-  seven_day=$(echo "$rate_limits" | jq -r '.seven_day.used_percentage // empty')
-
-  session_parts=""
-  if [ -n "$five_hour" ]; then
-    five_pct=$(printf '%.0f' "$five_hour")
-    if [ "$five_pct" -ge 80 ]; then
-      s_color="$RED"
-    elif [ "$five_pct" -ge 50 ]; then
-      s_color="$YELLOW"
-    else
-      s_color="$GREEN"
-    fi
-    session_parts="${s_color}5h:${five_pct}%${RESET}"
-  fi
-  if [ -n "$seven_day" ]; then
-    week_pct=$(printf '%.0f' "$seven_day")
-    if [ "$week_pct" -ge 80 ]; then
-      w_color="$RED"
-    elif [ "$week_pct" -ge 50 ]; then
-      w_color="$YELLOW"
-    else
-      w_color="$GREEN"
-    fi
-    [ -n "$session_parts" ] && session_parts="${session_parts} "
-    session_parts="${session_parts}${w_color}7d:${week_pct}%${RESET}"
-  fi
-
-  [ -n "$session_parts" ] && session_info=" ${DIM}·${RESET} ${DIM}session${RESET} ${session_parts}"
+session_parts=""
+if [ -n "$five_hour" ]; then
+  printf -v five_pct '%.0f' "$five_hour"
+  pct_color s_color "$five_pct"
+  session_parts="${s_color}5h:${five_pct}%${RESET}"
 fi
+if [ -n "$seven_day" ]; then
+  printf -v week_pct '%.0f' "$seven_day"
+  pct_color w_color "$week_pct"
+  [ -n "$session_parts" ] && session_parts="${session_parts} "
+  session_parts="${session_parts}${w_color}7d:${week_pct}%${RESET}"
+fi
+session_info=""
+[ -n "$session_parts" ] && session_info=" ${DIM}·${RESET} ${DIM}session${RESET} ${session_parts}"
 
 # Model + effort display
 model_display="${BLUE}${model_name}${RESET}"
